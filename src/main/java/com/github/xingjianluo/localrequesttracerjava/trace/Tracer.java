@@ -3,6 +3,7 @@ package com.github.xingjianluo.localrequesttracerjava.trace;
 import com.github.xingjianluo.localrequesttracerjava.trace.context.ActiveSpan;
 import com.github.xingjianluo.localrequesttracerjava.trace.context.TraceContext;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.LatencyClass;
+import com.github.xingjianluo.localrequesttracerjava.trace.model.FindResult;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.SpanData;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.SpanStatus;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.TraceRecord;
@@ -114,6 +115,11 @@ public final class Tracer {
 
     public Optional<TraceSnapshot> find(String traceId) {
         return store.find(traceId);
+    }
+
+    /** 带明确状态与归因视图的按标识查询：命中 / 过期 / 淘汰 / 从未记录。 */
+    public FindResult findDetailed(String traceId) {
+        return store.findDetailed(traceId);
     }
 
     /** 同步子操作模板：自动开/关 span，异常时归因后原样抛出。 */

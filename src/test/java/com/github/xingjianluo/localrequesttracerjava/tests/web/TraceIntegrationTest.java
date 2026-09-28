@@ -2,6 +2,7 @@ package com.github.xingjianluo.localrequesttracerjava.tests.web;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.SpanData;
+import com.github.xingjianluo.localrequesttracerjava.trace.model.TraceDetail;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.TraceSnapshot;
 import com.github.xingjianluo.localrequesttracerjava.web.TraceFilter;
 import org.junit.jupiter.api.Test;
@@ -51,7 +52,7 @@ class TraceIntegrationTest {
         MvcResult result = mockMvc.perform(get("/api/traces/{id}", traceId))
                 .andExpect(status().isOk())
                 .andReturn();
-        return objectMapper.readValue(result.getResponse().getContentAsString(), TraceSnapshot.class);
+        return objectMapper.readValue(result.getResponse().getContentAsString(), TraceDetail.class).trace();
     }
 
     @Test

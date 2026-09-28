@@ -32,12 +32,21 @@ public class TraceFilter extends OncePerRequestFilter {
     public static final String TRACE_ID_ATTRIBUTE = "traceId";
     private static final String MDC_KEY = "traceId";
 
+    /** 查询类只读接口本身不再开追踪，避免“查询结果被查询请求污染”、翻页被自身写入干扰。 */
+    private static final String TRACE_QUERY_PREFIX = "/api/traces";
+
     private static final Logger log = LoggerFactory.getLogger(TraceFilter.class);
 
     private final Tracer tracer;
 
     public TraceFilter(Tracer tracer) {
         this.tracer = tracer;
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        String uri = request.getRequestURI();
+        return uri != null && uri.startsWith(TRACE_QUERY_PREFIX);
     }
 
     @Override

@@ -3,21 +3,25 @@ package com.github.xingjianluo.localrequesttracerjava.config;
 import com.github.xingjianluo.localrequesttracerjava.trace.BoundedTraceStore;
 import com.github.xingjianluo.localrequesttracerjava.trace.ErrorClassifier;
 import com.github.xingjianluo.localrequesttracerjava.trace.TraceProperties;
+import com.github.xingjianluo.localrequesttracerjava.trace.TraceRetentionSweeper;
 import com.github.xingjianluo.localrequesttracerjava.trace.TraceStore;
 import com.github.xingjianluo.localrequesttracerjava.trace.Tracer;
 import com.github.xingjianluo.localrequesttracerjava.trace.async.TraceTaskDecorator;
+import com.github.xingjianluo.localrequesttracerjava.trace.query.TraceQueryService;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.core.task.TaskDecorator;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
 
 @Configuration
 @EnableAsync
+@EnableScheduling
 @EnableConfigurationProperties(TraceProperties.class)
 public class TraceConfig {
 
@@ -28,7 +32,17 @@ public class TraceConfig {
 
     @Bean
     public TraceStore traceStore(TraceProperties properties) {
-        return new BoundedTraceStore(properties.maxTraces());
+        return new BoundedTraceStore(properties.maxTraces(), properties.ttlMs());
+    }
+
+    @Bean
+    public TraceQueryService traceQueryService(TraceStore store) {
+        return new TraceQueryService(store);
+    }
+
+    @Bean
+    public TraceRetentionSweeper traceRetentionSweeper(TraceStore store, TraceProperties properties) {
+        return new TraceRetentionSweeper(store, properties.ttlMs());
     }
 
     @Bean

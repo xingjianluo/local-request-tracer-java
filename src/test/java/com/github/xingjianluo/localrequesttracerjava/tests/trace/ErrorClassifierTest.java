@@ -58,8 +58,28 @@ class ErrorClassifierTest {
     }
 
     @Test
-    void safeMessageNeverLeaksInternals() {
-        RuntimeException sensitive = new RuntimeException("db password=secret at com.internal.Foo.bar(Foo.java:42)");
+    void translatedOrWrappedFailuresStillResolveToRootCategory() {
+        // 同一根因经笼统外层/多层转译，结论必须仍归到根因类别
+        TimeoutException rootTimeout = new TimeoutException("slow");
+        assertCategory(rootTimeout, ErrorCategory.TIMEOUT, "原始超时");
+        assertCategory(new RuntimeException(new CompletionException(rootTimeout)),
+                ErrorCategory.TIMEOUT, "RuntimeException 套 CompletionException 套超时");
+        assertCategory(new java.lang.IllegalStateException(
+                        new java.util.concurrent.ExecutionException(rootTimeout)),
+                ErrorCategory.TIMEOUT, "状态异常包 ExecutionException 不得盖过超时根因");
+
+        ConnectException refused = new ConnectException("refused");
+        assertCategory(new RuntimeException("translated", new CompletionException(refused)),
+                ErrorCategory.UPSTREAM_FAILURE, "被转译的连接失败仍归下游失败");
+    }
+
+    @Test
+    void nullThrowableClassifiesAsUnknown() {
+        assertEquals(ErrorCategory.UNKNOWN, classifier.classify(null));
+    }
+
+    @Test
+    void safeMessageNeverLeaksInternals() {        RuntimeException sensitive = new RuntimeException("db password=secret at com.internal.Foo.bar(Foo.java:42)");
         String message = classifier.safeMessage(sensitive);
         log.info("safeMessage category={} message={}", classifier.classify(sensitive), message);
         assertFalse(message.contains("password"), "安全文案不得包含异常消息");

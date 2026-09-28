@@ -35,6 +35,18 @@ public class GlobalExceptionHandler {
         this.classifier = classifier;
     }
 
+    /** 非法查询参数（枚举值、时间范围、游标等）：归一为 400，不泄露内部细节。 */
+    @org.springframework.web.bind.annotation.ExceptionHandler(InvalidTraceQueryException.class)
+    public ResponseEntity<ApiError> handleBadRequest(InvalidTraceQueryException e) {
+        String traceId = TraceContext.currentTraceId();
+        log.info("bad request traceId={} reason={}", traceId, e.toString());
+        ApiError body = new ApiError(
+                com.github.xingjianluo.localrequesttracerjava.trace.model.ErrorCategory.VALIDATION_ERROR.name(),
+                com.github.xingjianluo.localrequesttracerjava.trace.model.ErrorCategory.VALIDATION_ERROR.safeMessage(),
+                traceId);
+        return ResponseEntity.badRequest().body(body);
+    }
+
     @ExceptionHandler(Throwable.class)
     public ResponseEntity<ApiError> handle(Throwable t) {
         ErrorCategory category = classifier.classify(t);
