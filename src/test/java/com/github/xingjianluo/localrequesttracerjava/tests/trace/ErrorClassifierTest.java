@@ -58,6 +58,32 @@ class ErrorClassifierTest {
     }
 
     @Test
+    void genericWrappersAlsoResolveToRootCause() {
+        // 非异步专用包装（普通 RuntimeException / Exception 转译）也要沿 cause 链找到根因
+        ConnectException root = new ConnectException("refused");
+        assertCategory(new RuntimeException(root), ErrorCategory.UPSTREAM_FAILURE,
+                "RuntimeException 普通包装");
+        assertCategory(new Exception(new RuntimeException(root)), ErrorCategory.UPSTREAM_FAILURE,
+                "受检异常双层包装");
+        assertCategory(new RuntimeException(new java.util.concurrent.TimeoutException("slow")),
+                ErrorCategory.TIMEOUT, "包装内超时优先识别");
+        // 无具体根因时维持兜底，不因 cause 链改变结论
+        assertCategory(new RuntimeException(new RuntimeException("boom")),
+                ErrorCategory.INTERNAL_ERROR, "链上无具体类别→兜底 INTERNAL_ERROR");
+    }
+
+    @Test
+    void cyclicCauseChainDoesNotHang() {
+        RuntimeException a = new RuntimeException("a");
+        RuntimeException b = new RuntimeException("b");
+        a.initCause(b);
+        b.initCause(a);
+        // cause 成环也必须正常返回，不能死循环
+        assertEquals(ErrorCategory.INTERNAL_ERROR, classifier.classify(a),
+                "cause 成环时安全终止并给兜底类别");
+    }
+
+    @Test
     void safeMessageNeverLeaksInternals() {
         RuntimeException sensitive = new RuntimeException("db password=secret at com.internal.Foo.bar(Foo.java:42)");
         String message = classifier.safeMessage(sensitive);

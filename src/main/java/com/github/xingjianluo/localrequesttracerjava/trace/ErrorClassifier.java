@@ -33,11 +33,36 @@ import java.util.concurrent.TimeoutException;
 public final class ErrorClassifier {
 
     public ErrorCategory classify(Throwable t) {
-        Throwable root = unwrap(t);
-        if (root == null) {
+        if (t == null) {
             return ErrorCategory.UNKNOWN;
         }
-        return doClassify(root);
+        // 第一步：剥掉异步/反应式透明包装层
+        Throwable root = unwrap(t);
+        ErrorCategory direct = doClassify(root);
+        // 外层本身已能确定具体类别时直接采用；
+        // 只落到兜底（INTERNAL_ERROR/UNKNOWN）时，沿 cause 链找更具体的根因，
+        // 保证同一种失败被任意 RuntimeException/受检异常转译包装后归类仍一致。
+        if (direct != ErrorCategory.INTERNAL_ERROR && direct != ErrorCategory.UNKNOWN) {
+            return direct;
+        }
+        ErrorCategory deeper = classifyByCause(root);
+        return deeper != null ? deeper : direct;
+    }
+
+    /** 沿 cause 链寻找第一个能确定具体类别的原因；用身份集合防止 cause 自引用成环。 */
+    private ErrorCategory classifyByCause(Throwable t) {
+        java.util.Set<Throwable> visited =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        visited.add(t);
+        Throwable current = t.getCause();
+        while (current != null && visited.add(current)) {
+            ErrorCategory category = doClassify(unwrap(current));
+            if (category != ErrorCategory.INTERNAL_ERROR && category != ErrorCategory.UNKNOWN) {
+                return category;
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 
     /** 对外安全文案：只来自类别定义，绝不包含异常消息或堆栈。 */

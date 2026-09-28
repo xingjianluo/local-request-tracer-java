@@ -116,6 +116,17 @@ public final class Tracer {
         return store.find(traceId);
     }
 
+    /** 按标识查询的完整结论：命中 / 已过期 / 被容量顶掉 / 从未记录。 */
+    public TraceLookup lookup(String traceId) {
+        return store.lookup(traceId);
+    }
+
+    /** 按条件批量查最近追踪（时间窗 + 成败 + 失败类别，倒序分页）。 */
+    public com.github.xingjianluo.localrequesttracerjava.trace.query.TracePage query(
+            com.github.xingjianluo.localrequesttracerjava.trace.query.TraceQuery query) {
+        return store.query(query);
+    }
+
     /** 同步子操作模板：自动开/关 span，异常时归因后原样抛出。 */
     public <T> T call(String name, String kind, Supplier<T> action) {
         ActiveSpan span = startSpan(name, kind);

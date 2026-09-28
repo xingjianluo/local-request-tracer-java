@@ -1,7 +1,7 @@
 # local-request-tracer-java
 
 本地请求追踪与延迟归因：一次请求在同步与异步链路中的耗时、异常与归属关系被稳定记录，
-数据保存在进程内，可按追踪标识查询，不依赖任何外部服务。
+数据保存在进程内，支持按标识查详情与按条件批量查最近追踪，不依赖任何外部服务。
 
 ## 快速开始
 
@@ -14,32 +14,95 @@ curl -i http://localhost:8080/api/demo/ok
 curl http://localhost:8080/api/traces/<traceId>
 
 # 其他演示入口
-curl http://localhost:8080/api/demo/slow?ms=600      # 慢操作归因
+curl http://localhost:8080/api/demo/slow?ms=600        # 慢操作归因
 curl http://localhost:8080/api/demo/fail?type=timeout  # 失败归一化（type: validation/conflict/timeout/upstream/io/unknown）
 ```
+
+## 查询接口
+
+### 按标识查详情
+
+```
+GET /api/traces/{traceId}
+```
+
+返回 `TraceSnapshot`：traceId、起止时间、总耗时、整体状态（任一 span 失败即 FAILED）、
+span 列表（含父子关系、耗时、线程、状态、错误类别、延迟归因），以及一层归因汇总
+`attribution`（见下）。按标识查询有三种"没有"的明确结论：
+
+| 场景 | HTTP | body.reason |
+|---|---|---|
+| 记录完整在库 | 200 | — |
+| 曾记录，但超过保留时长被过期回收 | 410 | `EXPIRED` |
+| 曾记录，但因容量上限被 FIFO 顶掉 | 410 | `EVICTED` |
+| 从未记录过该标识 | 404 | `NEVER_RECORDED` |
+
+> "已经过期回收了"和"压根没记录过"由此区分开。回收登记本身有界
+> （保留最近 `max-traces` 个回收结论），同 traceId 重新写入会撤销其旧登记。
+
+### 按条件批量查最近追踪
+
+```
+GET /api/traces?from=&to=&status=&category=&limit=&cursor=
+```
+
+| 参数 | 含义 |
+|---|---|
+| `from` / `to` | 时间窗起止，**epoch 毫秒，按 trace 结束时间过滤，两端含边界**；缺省（0）表示该侧不限 |
+| `status` | 整体结果：`SUCCESS` / `FAILED`；缺省不过滤成败 |
+| `category` | 失败类别（如 `TIMEOUT`/`VALIDATION_ERROR`），非空时隐含只取失败 |
+| `limit` | 单页条数，默认 50，最大 200 |
+| `cursor` | 上一页返回的不透明分页游标 |
+
+返回 `TracePage`：`items`（不含 span 明细的 `TraceSummary`，但带同一层 `attribution`）、
+`nextCursor`、`hasMore`。
+
+**排序与稳定性**：统一按 `(结束时间倒序, traceId 倒序)`。游标只承载上一页最后一条的
+`(endEpochMs, traceId)` 且不依赖存储当前内容，因此同条件翻页次序可复现、不重不漏；
+后台持续写入不会让同一批结果抖动，窗口外的新写入也不会混进结果。
+列表查询在锁内拷贝一份一致快照后再过滤排序，条目要么完整要么不出现，不会读到半截。
+
+## 一层归因汇总（列表与详情同口径）
+
+`TraceSnapshot.attribution` / `TraceSummary.attribution` 为：
+
+```jsonc
+{
+  "errorCategory": "TIMEOUT",        // 整链最终失败类别；成功链路为 null
+  "slowestSpan": {                   // 最费时间的一环：名字 + 耗时
+    "spanId": "...", "name": "wait-http", "durationMs": 812
+  }
+}
+```
+
+口径：
+
+- **最终失败类别**：span 按结束先后排列，取**第一个 FAILED span** 的归一化类别，
+  代表链路上最早暴露失败的一环。
+- **最慢一环**：优先在**子 span** 中取 `durationMs` 最大者（根 span 包住整条链路、
+  耗时天然最大，不指向具体卡点，故不参与）；整条链路只有根 span 时回退到根 span；
+  并列耗时取更早出现的一环，结论确定。
+- **归类与路径无关（兼容范围）**：判定只依赖异常类型。`ErrorClassifier` 先剥掉
+  `CompletionException`/`ExecutionException` 等异步透明包装；外层只落到兜底类别
+  （INTERNAL_ERROR/UNKNOWN）时，继续沿 `cause` 链找更具体的根因（带成环保护）。
+  因此同一根因无论从同步入口进来、绕异步、或被任意 RuntimeException/受检异常
+  转译包装，最终类别一致，多条链路做类别统计不会被拆成两类。对外安全文案仍只来自
+  类别定义，不含异常类名、消息或堆栈。
 
 ## 追踪上下文传播规则
 
 - **入口**：`TraceFilter` 为每个 HTTP 请求开启一条追踪链（SERVER 根 span），
   traceId 由服务端生成（不信任外部传入，避免跨系统串链），
   通过响应头 `X-Trace-Id`、请求属性 `traceId` 与日志 MDC 暴露。
-- **同线程**：`TraceContext` 用 ThreadLocal 维护未结束 span 栈，
-  子 span 自动以栈顶 span 为父。
-- **跨线程 / 异步**：提交方 `TraceContext.capture()` 捕获
-  `{traceId, 当前spanId}`，执行方 `attach()` 安装；执行线程的首个 span
-  以提交时刻的 span 为父，之后恢复线程内正常栈式父子关系。
-  `TraceTaskDecorator` 已挂到应用主异步执行器（`@Primary Executor`），
-  `@Async` 与注入 `Executor` 的任务自动获得传播能力，无需业务代码配合。
-- **清理**：`attach` 返回的 `Scope` 关闭后移除安装；请求结束 `TraceFilter`
-  在 finally 中关闭 trace 并清理 ThreadLocal 与 MDC，
-  线程池线程复用不会残留上一次请求的上下文（不串链）。
-- **降级**：无追踪上下文时 `startSpan` 返回 null，静默降级，不阻断业务。
+- **同线程**：`TraceContext` 用 ThreadLocal 维护未结束 span 栈，子 span 自动以栈顶 span 为父。
+- **跨线程 / 异步**：提交方 `TraceContext.capture()` 捕获 `{traceId, 当前spanId}`，
+  执行方 `attach()` 安装；执行线程的首个 span 以提交时刻的 span 为父，
+  之后恢复线程内正常栈式父子关系。`TraceTaskDecorator` 已挂到应用主异步执行器
+  （`@Primary Executor`），`@Async` 与注入 `Executor` 的任务自动获得传播能力。
+- **清理 / 降级**：`Scope` 关闭即移除安装，请求结束在 finally 中关闭 trace 并清理
+  ThreadLocal 与 MDC，线程复用不串链；无上下文时 `startSpan` 返回 null，静默降级。
 
 ## 错误分类口径
-
-原始异常经 `ErrorClassifier` 归一化为稳定类别，判定**只依赖异常类型**
-（含 `CompletionException`/`ExecutionException` 包装链与 `cause` 链），
-与入口、异常消息无关——同一类失败在任何入口下结论一致。
 
 | 类别 | HTTP | 典型来源 |
 |---|---|---|
@@ -49,44 +112,48 @@ curl http://localhost:8080/api/demo/fail?type=timeout  # 失败归一化（type:
 | NOT_FOUND | 404 | 静态资源不存在等 |
 | CONFLICT | 409 | IllegalStateException |
 | RATE_LIMITED | 429 | 线程池拒绝 RejectedExecutionException |
-| UPSTREAM_FAILURE | 502 | ConnectException / IOException |
+| UPSTREAM_FAILURE | 502 | ConnectException / IOException（含被包装在 cause 链中） |
 | TIMEOUT | 504 | TimeoutException / SocketTimeoutException / HttpTimeoutException |
 | INTERNAL_ERROR | 500 | 其他未识别 RuntimeException |
 | UNKNOWN | 500 | 未识别受检异常 |
 
 **对外口径**：响应体只有 `{category, message, traceId}`，message 固定为类别的
 安全文案，绝不包含异常类名、消息或堆栈；原始异常只进服务端日志（带 traceId）。
-span 上同样只记录类别与安全文案。首次失败结论为准，避免后续覆盖导致归因漂移。
+span 首次失败结论为准，避免后续覆盖导致归因漂移。
 
 **延迟归因**：span 耗时 ≥ `trace.slow-threshold-ms` 标记 `SLOW`，否则 `NORMAL`，
 并输出慢操作日志（含 traceId、span 名、耗时、阈值）。
 
-## 存储上限与淘汰
+## 存储：容量上限与时间过期如何配合
 
-- `BoundedTraceStore` 容量由 `trace.max-traces` 固定（默认 1024）。
-- 写满后按 **FIFO** 淘汰最早写入的追踪，淘汰顺序与查询频率无关，行为确定。
-- 插入与淘汰在同一把内部锁下完成，`size` 永不超过容量。
-- 落库对象是 trace 关闭时一次性生成的**不可变快照**（`TraceSnapshot`，
-  span 列表防御式拷贝），高并发写入下不会出现半截记录或跨追踪混合；
-  查询接口只返回快照。
-- 开销控制：追踪仅为 ThreadLocal 读写 + 结束时的不可变对象组装，
-  无 I/O、无锁竞争热点（存储锁只在落库瞬间持有）；无上下文时直接降级。
+`BoundedTraceStore` 同时受两层回收约束，规则明确、**先到先算**：
+
+1. **按时间过期**：以 trace 的**结束时间** `endEpochMs` 计，
+   `endEpochMs + trace.retention-ms <= now` 即过期（边界含到期那一刻）。
+   `trace.retention-ms=0` 表示关闭按时间过期。
+2. **按容量 FIFO**：写满 `trace.max-traces` 后顶掉最早写入的。
+
+每次 `save` 在**同一把锁**内按固定顺序处理：**先清过期，再做容量检查**。
+即一条记录若在写入点恰好既过期又"该被顶掉"，离开原因记为 `EXPIRED`（先到先算）；
+容量顶掉记为 `EVICTED`。过期回收除了在写入时顺带执行，也会在 `lookup`/`query` 时
+顺带触发，另有可配置的后台扫描。所有增删与回收登记同锁，落库对象是 trace 关闭时
+一次性生成的不可变快照（span 列表防御式拷贝），并发查询要么拿到完整记录要么得到
+明确的"没有"，不存在半截记录。
 
 配置（`application.properties`）：
 
 ```properties
 trace.max-traces=1024        # 本地存储容量上限
 trace.slow-threshold-ms=500  # 慢操作阈值
+trace.retention-ms=3600000   # 保留时长（毫秒，按结束时间）；0 关闭按时间过期
+trace.sweep-interval-ms=30000 # 后台过期扫描间隔（毫秒）；0 不启动后台扫描
 ```
 
-## 查询接口
+> 后台扫描仅当 `retention-ms>0` 且 `sweep-interval-ms>0` 时注册；
+> 关掉后过期回收仍会在写入/查询时顺带完成，只是不主动清。
 
-```
-GET /api/traces/{traceId}
-```
-
-返回 `TraceSnapshot`：traceId、起止时间、总耗时、整体状态（任一 span 失败即 FAILED）、
-span 列表（含父子关系、耗时、线程、状态、错误类别、延迟归因）。不存在返回 404。
+开销：追踪仅为 ThreadLocal 读写 + 结束时的不可变对象组装，无 I/O；
+存储锁只在落库/回收/查询拷贝瞬间持有，查询在拷贝后于锁外过滤排序。
 
 ## 验证方法
 
@@ -94,12 +161,23 @@ span 列表（含父子关系、耗时、线程、状态、错误类别、延迟
 mvn test
 ```
 
-测试以并发与异常路径为主，日志均打印 traceId 与判定依据：
+- `TraceRetentionTest`：过期边界（end+ttl 先到先算）、过期三态（EXPIRED/EVICTED/
+  NEVER_RECORDED）可区分、过期与容量同时触发时原因不串、同 id 重写撤销旧登记、
+  主动 purge、以及 8 读 4 写并发清理下读不到半截记录。
+- `TraceQueryTest`：时间窗（含边界）+ 成败 + 失败类别多条件筛选、
+  结束时间倒序与 traceId 稳定次序、limit 默认值/封顶、游标分页不重不漏且可拼接成全量、
+  坏游标从头开始、后台持续写入时同一条件结果不抖动且条目完整。
+- `TraceAttributionTest`：成功链路最慢子环、失败链路整链类别与最慢环、
+  同根因走同步/异步/CompletableFuture 包装三类路径归类一致、只有根 span 时回退、并列取更早。
+- `ErrorClassifierTest`：类别可区分、异步包装与**任意 cause 链包装**结论一致、
+  cause 成环安全终止、安全文案不泄露内部信息。
+- `TraceQueryIntegrationTest`：端到端验证列表多条件筛选与归因字段、410/404 区分、游标翻页。
+- `TracerConcurrencyTest`（回归）：32 线程并发建链不串链、异步子操作归属、失败不静默丢失。
+- `TraceIntegrationTest` / `BoundedTraceStoreTest`（回归）：端到端追踪与原有容量 FIFO、并发写入。
 
-- `TracerConcurrencyTest`：32 线程并发建链，验证不串链（每 trace 恰好 1 根 + 5 子、
-  父链不跨 trace）、异步子操作归属提交点 span、三种失败类别可区分且不静默丢失。
-- `TraceIntegrationTest`：端到端验证 `/api/demo/ok` 同步+异步子操作同属一条 trace、
-  慢操作归因 SLOW、失败入口返回归一化类别且响应体不含异常细节、未知 traceId 返回 404。
-- `ErrorClassifierTest`：类别可区分、异步包装后结论一致、安全文案不泄露内部信息。
-- `BoundedTraceStoreTest`：容量上限确定、FIFO 淘汰确定、16 线程 × 200 次并发写入后
-  size 不超容量且记录完整不混合。
+手动验证过期三态（可选）：
+
+```bash
+# 用极短保留时长启动，请求后等待超过保留时长再查详情，观察 410/EXPIRED 与 404/NEVER_RECORDED
+mvn spring-boot:run -Dspring-boot.run.arguments=--trace.retention-ms=3000,--trace.sweep-interval-ms=0
+```

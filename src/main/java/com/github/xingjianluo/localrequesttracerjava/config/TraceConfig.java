@@ -12,12 +12,15 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.core.task.TaskDecorator;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
+import java.time.Clock;
 import java.util.concurrent.Executor;
 
 @Configuration
 @EnableAsync
+@EnableScheduling
 @EnableConfigurationProperties(TraceProperties.class)
 public class TraceConfig {
 
@@ -28,12 +31,21 @@ public class TraceConfig {
 
     @Bean
     public TraceStore traceStore(TraceProperties properties) {
-        return new BoundedTraceStore(properties.maxTraces());
+        return new BoundedTraceStore(properties.maxTraces(), properties.retentionMs(), Clock.systemUTC());
     }
 
     @Bean
     public Tracer tracer(TraceStore store, ErrorClassifier classifier, TraceProperties properties) {
         return new Tracer(store, classifier, properties.slowThresholdMs());
+    }
+
+    /** 仅当保留时长与扫描间隔都为正时才注册后台过期回收。 */
+    @Bean
+    @org.springframework.context.annotation.Conditional(TraceRetentionCondition.class)
+    public com.github.xingjianluo.localrequesttracerjava.trace.TraceRetentionSweeper traceRetentionSweeper(
+            TraceStore store, TraceProperties properties) {
+        return new com.github.xingjianluo.localrequesttracerjava.trace.TraceRetentionSweeper(
+                store, properties.sweepIntervalMs());
     }
 
     @Bean
