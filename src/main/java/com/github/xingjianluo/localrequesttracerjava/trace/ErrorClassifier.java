@@ -14,8 +14,9 @@ import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpTimeoutException;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ExecutionException;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeoutException;
 
@@ -24,8 +25,15 @@ import java.util.concurrent.TimeoutException;
  *
  * <p>口径：
  * <ul>
- *   <li>判定只依赖异常类型（含包装链与 cause 链），与入口、消息内容无关，
- *       同一类失败在任何入口下结论一致；</li>
+ *   <li>判定只依赖异常类型（沿整条 {@code getCause()} 链逐层判定，含
+ *       CompletionException/ExecutionException 等异步包装层），与入口、消息内容无关，
+ *       同一类失败在同步入口、异步链路、被任意转译包装后结论都一致；</li>
+ *   <li><b>更深的根因优先</b>：只要链上更深处能对上更具体的类别，即使中间层本身
+ *       也对得上某个具体类别，最终也以最深处的具体类别为准，保证同一根因的记录
+ *       能被同一个失败类别条件一次查全，不会按路径被拆成两类；</li>
+ *   <li>整条链都对不上具体类别时，取<b>最外层</b>的兜底结论
+ *       （INTERNAL_ERROR / UNKNOWN）；cause 互相引用成环时用身份集合安全终止，
+ *       绝不卡死或抛出；</li>
  *   <li>对外文案只取 {@link ErrorCategory#safeMessage()}，
  *       绝不携带异常消息、类名或堆栈。</li>
  * </ul>
@@ -36,49 +44,34 @@ public final class ErrorClassifier {
         if (t == null) {
             return ErrorCategory.UNKNOWN;
         }
-        // 第一步：剥掉异步/反应式透明包装层
-        Throwable root = unwrap(t);
-        ErrorCategory direct = doClassify(root);
-        // 外层本身已能确定具体类别时直接采用；
-        // 只落到兜底（INTERNAL_ERROR/UNKNOWN）时，沿 cause 链找更具体的根因，
-        // 保证同一种失败被任意 RuntimeException/受检异常转译包装后归类仍一致。
-        if (direct != ErrorCategory.INTERNAL_ERROR && direct != ErrorCategory.UNKNOWN) {
-            return direct;
-        }
-        ErrorCategory deeper = classifyByCause(root);
-        return deeper != null ? deeper : direct;
-    }
-
-    /** 沿 cause 链寻找第一个能确定具体类别的原因；用身份集合防止 cause 自引用成环。 */
-    private ErrorCategory classifyByCause(Throwable t) {
-        java.util.Set<Throwable> visited =
-                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
-        visited.add(t);
-        Throwable current = t.getCause();
+        // 逐层走完整条 cause 链（CompletionException/ExecutionException 等透明包装
+        // 与普通 RuntimeException/受检转译在这一过程中天然被穿透，无需单独剥壳）。
+        // 具体类别随遍历持续覆盖——最深的具体根因最终胜出；
+        // 兜底类别只记最外层那一个；visited 为身份集合，cause 成环时安全终止。
+        Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        ErrorCategory fallback = null;
+        ErrorCategory deepestSpecific = null;
+        Throwable current = t;
         while (current != null && visited.add(current)) {
-            ErrorCategory category = doClassify(unwrap(current));
-            if (category != ErrorCategory.INTERNAL_ERROR && category != ErrorCategory.UNKNOWN) {
-                return category;
+            ErrorCategory category = doClassify(current);
+            if (category == ErrorCategory.INTERNAL_ERROR || category == ErrorCategory.UNKNOWN) {
+                if (fallback == null) {
+                    fallback = category;
+                }
+            } else {
+                deepestSpecific = category;
             }
             current = current.getCause();
         }
-        return null;
+        if (deepestSpecific != null) {
+            return deepestSpecific;
+        }
+        return fallback != null ? fallback : ErrorCategory.UNKNOWN;
     }
 
     /** 对外安全文案：只来自类别定义，绝不包含异常消息或堆栈。 */
     public String safeMessage(Throwable t) {
         return classify(t).safeMessage();
-    }
-
-    /** 剥掉异步/反应式包装层，拿到真实失败原因。 */
-    private Throwable unwrap(Throwable t) {
-        Throwable current = t;
-        while (current != null
-                && (current instanceof CompletionException || current instanceof ExecutionException)
-                && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
     }
 
     private ErrorCategory doClassify(Throwable t) {

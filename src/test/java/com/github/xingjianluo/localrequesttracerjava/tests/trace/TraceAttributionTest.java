@@ -9,22 +9,28 @@ import com.github.xingjianluo.localrequesttracerjava.trace.model.ErrorCategory;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.SlowestSpan;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.SpanStatus;
 import com.github.xingjianluo.localrequesttracerjava.trace.model.TraceSnapshot;
+import com.github.xingjianluo.localrequesttracerjava.trace.query.TracePage;
+import com.github.xingjianluo.localrequesttracerjava.trace.query.TraceQuery;
+import com.github.xingjianluo.localrequesttracerjava.trace.query.TraceSummary;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.ConnectException;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 一层归因汇总：整链最终失败类别、最慢一环（名字+耗时），
@@ -143,6 +149,81 @@ class TraceAttributionTest {
                 sync.attribution().errorCategory(),
                 async.attribution().errorCategory(),
                 future.attribution().errorCategory());
+    }
+
+    @Test
+    void specificMiddleLayerStillDefersToDeeperRootCauseAcrossPaths() throws InterruptedException {
+        // 关键场景：中间那层异常本身也对得上具体类别（IllegalStateException→CONFLICT），
+        // 但更深处是明确的超时根因。同一条根因走 同步直接抛 / 异步包装 / 中间转译，
+        // 整链最终类别必须都是 TIMEOUT——这样按 TIMEOUT 筛选时一次查全，不被路径拆分。
+        final String[] directIdHolder = new String[1];
+        try (Tracer.TraceHandle h = tracer.beginTrace("root", "TEST")) {
+            directIdHolder[0] = h.traceId();
+            tracer.call("downstream", "HTTP", () -> {
+                throw new java.util.concurrent.CompletionException(new TimeoutException("slow"));
+            });
+        } catch (RuntimeException ignored) {
+        }
+        String directId = directIdHolder[0];
+
+        final String[] translatedIdHolder = new String[1];
+        try (Tracer.TraceHandle h = tracer.beginTrace("root", "TEST")) {
+            translatedIdHolder[0] = h.traceId();
+            tracer.call("downstream", "HTTP", () -> {
+                // 中间层把超时转译成状态冲突：外层 CONFLICT 具体、深处 TIMEOUT 更具体
+                throw new IllegalStateException(new TimeoutException("slow"));
+            });
+        } catch (RuntimeException ignored) {
+        }
+        String translatedId = translatedIdHolder[0];
+
+        final String[] asyncIdHolder = new String[1];
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch done = new CountDownLatch(1);
+        try (Tracer.TraceHandle h = tracer.beginTrace("root", "TEST")) {
+            asyncIdHolder[0] = h.traceId();
+            TraceContext.ContextSnapshot captured = TraceContext.capture();
+            pool.submit(() -> {
+                try (TraceContext.Scope ignored = TraceContext.attach(captured)) {
+                    tracer.call("downstream", "HTTP", () -> {
+                        throw new CompletionException(new IllegalStateException(new TimeoutException("slow")));
+                    });
+                } catch (CompletionException expected) {
+                    // 异步包装 + 具体中间层 + 深处超时，根因不变
+                } finally {
+                    done.countDown();
+                }
+            });
+            done.await(10, TimeUnit.SECONDS);
+        }
+        pool.shutdownNow();
+        String asyncId = asyncIdHolder[0];
+
+        for (String id : java.util.List.of(directId, translatedId, asyncId)) {
+            TraceSnapshot s = tracer.find(id).orElseThrow();
+            assertEquals(SpanStatus.FAILED, s.status(), id);
+            assertEquals(ErrorCategory.TIMEOUT, s.attribution().errorCategory(),
+                    "外层/中间层对得上 CONFLICT 时，仍以深处超时根因 TIMEOUT 为准：" + id);
+        }
+
+        // 按失败类别筛选必须一次查全三条路径的同根因记录，不拆成 TIMEOUT/CONFLICT 两类
+        TracePage page = tracer.query(new TraceQuery(0, 0, null, ErrorCategory.TIMEOUT, 100, null));
+        List<String> timeoutIds = page.items().stream().map(TraceSummary::traceId).toList();
+        assertTrue(timeoutIds.contains(directId), "异步包装路径必须能被 TIMEOUT 条件查全");
+        assertTrue(timeoutIds.contains(translatedId), "中间层转译路径必须能被 TIMEOUT 条件查全");
+        assertTrue(timeoutIds.contains(asyncId), "异步+转译路径必须能被 TIMEOUT 条件查全");
+        for (TraceSummary item : page.items()) {
+            assertEquals(ErrorCategory.TIMEOUT, item.attribution().errorCategory());
+        }
+        // 同批记录不得被误归到 CONFLICT
+        TracePage conflicts = tracer.query(new TraceQuery(0, 0, null, ErrorCategory.CONFLICT, 100, null));
+        for (TraceSummary item : conflicts.items()) {
+            org.junit.jupiter.api.Assertions.assertFalse(
+                    java.util.List.of(directId, translatedId, asyncId).contains(item.traceId()),
+                    "同根因记录不得被路径拆到 CONFLICT 类");
+        }
+        log.info("deeper-root attribution direct={} translated={} async={}",
+                directId, translatedId, asyncId);
     }
 
     @Test
