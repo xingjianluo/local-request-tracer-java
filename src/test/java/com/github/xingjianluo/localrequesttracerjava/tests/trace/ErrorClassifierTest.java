@@ -84,6 +84,75 @@ class ErrorClassifierTest {
     }
 
     @Test
+    void deeperMoreSpecificRootCauseWinsOverConcreteOuterCategory() {
+        // 外层本身也对得上某个具体类别（CONFLICT），但更深处是更具体的超时根因：
+        // 必须以更深处更明确的根因为准
+        assertCategory(new IllegalStateException(new TimeoutException("slow")),
+                ErrorCategory.TIMEOUT, "外层 CONFLICT 但深处 TIMEOUT → TIMEOUT");
+        // 参数异常（VALIDATION_ERROR）包着 socket 超时，同样以深处根因为准
+        assertCategory(new IllegalArgumentException(new SocketTimeoutException("read timed out")),
+                ErrorCategory.TIMEOUT, "外层 VALIDATION 但深处 socket 超时 → TIMEOUT");
+        // 外层 CONFLICT、深处连接失败：UPSTREAM_FAILURE 比 CONFLICT 更接近根因
+        assertCategory(new IllegalStateException(new ConnectException("refused")),
+                ErrorCategory.UPSTREAM_FAILURE, "外层 CONFLICT 但深处连接失败 → UPSTREAM_FAILURE");
+        // 外层 CONFLICT、深处普通 IO 失败
+        assertCategory(new IllegalStateException(new IOException("broken pipe")),
+                ErrorCategory.UPSTREAM_FAILURE, "外层 CONFLICT 但深处 IO 失败 → UPSTREAM_FAILURE");
+        // 异步透明包装再被具体异常转译一次，结论仍由最深处根因决定
+        assertCategory(new IllegalArgumentException(
+                        new CompletionException(new SocketTimeoutException("read timed out"))),
+                ErrorCategory.TIMEOUT, "转译 + 异步双层包装后仍以深处 TIMEOUT 为准");
+        // 超时压过上游 IO：IOException 内层再包超时，仍归 TIMEOUT
+        assertCategory(new IOException(new SocketTimeoutException("read timed out")),
+                ErrorCategory.TIMEOUT, "IO 包装超时 → 更具体的 TIMEOUT");
+    }
+
+    @Test
+    void sameRootCauseWrappedOrTranslatedKeepsOneCategory() {
+        // 同一条超时根因，直接抛 / 异步包装 / 被具体异常转译，类别必须完全一致
+        Throwable root = new SocketTimeoutException("read timed out");
+        assertCategory(root, ErrorCategory.TIMEOUT, "同步直接抛");
+        assertCategory(new CompletionException(root), ErrorCategory.TIMEOUT, "异步 CompletionException");
+        assertCategory(new ExecutionException(root), ErrorCategory.TIMEOUT, "异步 ExecutionException");
+        assertCategory(new IllegalStateException(root), ErrorCategory.TIMEOUT,
+                "被 CONFLICT 类异常转译包装");
+        assertCategory(new IllegalArgumentException(new RuntimeException(root)),
+                ErrorCategory.TIMEOUT, "被多层异常转译包装");
+
+        // 同一条连接失败根因走同样几条路径也一致（含外层本身命中 CONFLICT 的情形）
+        Throwable refused = new ConnectException("refused");
+        for (Throwable t : java.util.List.of(
+                refused,
+                new CompletionException(refused),
+                new IllegalStateException(refused),
+                new IllegalArgumentException(new RuntimeException(refused)))) {
+            assertEquals(ErrorCategory.UPSTREAM_FAILURE, classifier.classify(t),
+                    "连接失败根因在任何包装/转译路径下归类一致: " + t.getClass().getSimpleName());
+        }
+    }
+
+    @Test
+    void noMoreSpecificCauseFallsBackSafelyAndCyclesAcrossConcreteCategoriesTerminate() {
+        // 外层具体、链上没有更具体的根因：维持外层类别，不被兜底内层改写
+        assertCategory(new IllegalStateException(new RuntimeException("boom")),
+                ErrorCategory.CONFLICT, "外层 CONFLICT、内层仅兜底 → 维持 CONFLICT");
+        assertCategory(new IllegalArgumentException(new Exception("checked")),
+                ErrorCategory.VALIDATION_ERROR, "外层 VALIDATION、内层受检未知 → 维持 VALIDATION");
+        // 链上只有兜底类别：INTERNAL_ERROR 优先于 UNKNOWN，链上深处兜底不改变结论
+        assertCategory(new RuntimeException(new Exception("checked")),
+                ErrorCategory.INTERNAL_ERROR, "运行时兜底不被 UNKNOWN 内层改写");
+
+        // 具体类别之间互相引用成环：必须安全终止，不卡死、不报错
+        IllegalStateException a = new IllegalStateException("a");
+        IllegalArgumentException b = new IllegalArgumentException("b");
+        a.initCause(b);
+        b.initCause(a);
+        ErrorCategory cyclic = classifier.classify(a);
+        assertEquals(ErrorCategory.VALIDATION_ERROR, cyclic,
+                "具体类别成环时安全终止，并按同优先级取更深一层");
+    }
+
+    @Test
     void safeMessageNeverLeaksInternals() {
         RuntimeException sensitive = new RuntimeException("db password=secret at com.internal.Foo.bar(Foo.java:42)");
         String message = classifier.safeMessage(sensitive);

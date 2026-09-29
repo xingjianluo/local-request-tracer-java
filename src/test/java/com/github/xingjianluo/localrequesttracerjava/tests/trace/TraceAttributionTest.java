@@ -168,6 +168,55 @@ class TraceAttributionTest {
         assertEquals("first", tied.attribution().slowestSpan().name(), "并列耗时取更早一环");
     }
 
+    @Test
+    void concreteOuterWrapperStillAttributesToDeeperSpecificRootCause() throws InterruptedException {
+        // 外层异常本身对得上具体类别（IllegalStateException→CONFLICT），
+        // 但更深处是更明确的超时根因（SocketTimeoutException→TIMEOUT）。
+        // 同步与异步两条路径下，整链类别都必须归到 TIMEOUT，按类别筛选不能被拆成两类。
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            final String[] syncHolder = new String[1];
+            try (Tracer.TraceHandle h = tracer.beginTrace("root", "TEST")) {
+                syncHolder[0] = h.traceId();
+                tracer.call("downstream", "HTTP", () -> {
+                    throw new IllegalStateException(
+                            new java.net.SocketTimeoutException("read timed out"));
+                });
+            } catch (RuntimeException ignored) {
+            }
+
+            String asyncId;
+            try (Tracer.TraceHandle h = tracer.beginTrace("root", "TEST")) {
+                asyncId = h.traceId();
+                TraceContext.ContextSnapshot captured = TraceContext.capture();
+                CountDownLatch done = new CountDownLatch(1);
+                pool.submit(() -> {
+                    try (TraceContext.Scope ignored = TraceContext.attach(captured)) {
+                        tracer.call("downstream", "HTTP", () -> {
+                            throw new java.util.concurrent.CompletionException(
+                                    new IllegalStateException(
+                                            new java.net.SocketTimeoutException("read timed out")));
+                        });
+                    } catch (RuntimeException expected) {
+                        // 包装/转译不影响归类
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                done.await(10, TimeUnit.SECONDS);
+            }
+
+            TraceSnapshot sync = tracer.find(syncHolder[0]).orElseThrow();
+            TraceSnapshot async = tracer.find(asyncId).orElseThrow();
+            assertEquals(ErrorCategory.TIMEOUT, sync.attribution().errorCategory(),
+                    "外层 CONFLICT 不能盖过深处 TIMEOUT 根因（同步路径）");
+            assertEquals(ErrorCategory.TIMEOUT, async.attribution().errorCategory(),
+                    "外层 CONFLICT 不能盖过深处 TIMEOUT 根因（异步路径）");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     private static void sleep(long ms) {
         try {
             Thread.sleep(ms);

@@ -14,8 +14,6 @@ import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpTimeoutException;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeoutException;
 
@@ -36,49 +34,60 @@ public final class ErrorClassifier {
         if (t == null) {
             return ErrorCategory.UNKNOWN;
         }
-        // 第一步：剥掉异步/反应式透明包装层
-        Throwable root = unwrap(t);
-        ErrorCategory direct = doClassify(root);
-        // 外层本身已能确定具体类别时直接采用；
-        // 只落到兜底（INTERNAL_ERROR/UNKNOWN）时，沿 cause 链找更具体的根因，
-        // 保证同一种失败被任意 RuntimeException/受检异常转译包装后归类仍一致。
-        if (direct != ErrorCategory.INTERNAL_ERROR && direct != ErrorCategory.UNKNOWN) {
-            return direct;
-        }
-        ErrorCategory deeper = classifyByCause(root);
-        return deeper != null ? deeper : direct;
-    }
-
-    /** 沿 cause 链寻找第一个能确定具体类别的原因；用身份集合防止 cause 自引用成环。 */
-    private ErrorCategory classifyByCause(Throwable t) {
+        // 遍历整条 cause 链（CompletionException/ExecutionException 等异步透明包装
+        // 本身只落到兜底类别，无需特判剥层），在链上选出"最具体的根因类别"：
+        //   1) 先按类别具体度优先级 specificity 取高者——更深处更明确的根因
+        //      可以压过外层本身已对上的类别（如 IllegalStateException(TimeoutException)
+        //      仍归 TIMEOUT，而非 CONFLICT）；
+        //   2) 优先级相同时取链上更深者——同一组异常无论从同步入口、绕异步、
+        //      还是被任意 RuntimeException/受检异常转译包装，结论都一致。
+        // 身份集合防止 cause 自引用/互相引用成环导致死循环。
         java.util.Set<Throwable> visited =
                 java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
-        visited.add(t);
-        Throwable current = t.getCause();
+        ErrorCategory best = ErrorCategory.UNKNOWN;
+        Throwable current = t;
         while (current != null && visited.add(current)) {
-            ErrorCategory category = doClassify(unwrap(current));
-            if (category != ErrorCategory.INTERNAL_ERROR && category != ErrorCategory.UNKNOWN) {
-                return category;
+            ErrorCategory category = doClassify(current);
+            if (replaceBySpecificity(category, best, current, t)) {
+                best = category;
             }
             current = current.getCause();
         }
-        return null;
+        return best;
+    }
+
+    /**
+     * 是否用链上更深一层的类别 {@code candidate} 替换当前结论 {@code incumbent}：
+     * 具体度优先级更高则替换；优先级相同且候选位于更深层（不是最外层）时也替换。
+     */
+    private boolean replaceBySpecificity(ErrorCategory candidate, ErrorCategory incumbent,
+                                         Throwable candidateNode, Throwable outermost) {
+        int candidateRank = specificity(candidate);
+        int incumbentRank = specificity(incumbent);
+        if (candidateRank != incumbentRank) {
+            return candidateRank > incumbentRank;
+        }
+        return candidateRank > 0 && candidateNode != outermost;
+    }
+
+    /**
+     * 类别具体度优先级：越大越"像根因"。
+     * 兜底类别（UNKNOWN/INTERNAL_ERROR）最低；超时是比上游 IO 失败更具体的归因，
+     * 因此无论处在链上哪一层都压过 UPSTREAM_FAILURE。
+     */
+    private int specificity(ErrorCategory category) {
+        return switch (category) {
+            case UNKNOWN -> 0;
+            case INTERNAL_ERROR -> 1;
+            case TIMEOUT -> 5;
+            case UPSTREAM_FAILURE -> 4;
+            default -> 2;
+        };
     }
 
     /** 对外安全文案：只来自类别定义，绝不包含异常消息或堆栈。 */
     public String safeMessage(Throwable t) {
         return classify(t).safeMessage();
-    }
-
-    /** 剥掉异步/反应式包装层，拿到真实失败原因。 */
-    private Throwable unwrap(Throwable t) {
-        Throwable current = t;
-        while (current != null
-                && (current instanceof CompletionException || current instanceof ExecutionException)
-                && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
     }
 
     private ErrorCategory doClassify(Throwable t) {

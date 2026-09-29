@@ -62,6 +62,12 @@ GET /api/traces?from=&to=&status=&category=&limit=&cursor=
 后台持续写入不会让同一批结果抖动，窗口外的新写入也不会混进结果。
 列表查询在锁内拷贝一份一致快照后再过滤排序，条目要么完整要么不出现，不会读到半截。
 
+**查询动作本身不落库**：`/api/traces`（含列表与按标识查详情）是"读取统计结果"的入口，
+`TraceFilter` 对这类请求直接放行，不开链、不落库（响应也不带 `X-Trace-Id`）。
+因此查询请求不会混进被统计的追踪：同一筛选条件连续重复查询，结果集合、次序乃至
+响应体都保持一致，不会"越查冒出的新条目越多"。被统计的只有 `/api/demo/**` 等
+真实业务入口。
+
 ## 一层归因汇总（列表与详情同口径）
 
 `TraceSnapshot.attribution` / `TraceSummary.attribution` 为：
@@ -82,12 +88,23 @@ GET /api/traces?from=&to=&status=&category=&limit=&cursor=
 - **最慢一环**：优先在**子 span** 中取 `durationMs` 最大者（根 span 包住整条链路、
   耗时天然最大，不指向具体卡点，故不参与）；整条链路只有根 span 时回退到根 span；
   并列耗时取更早出现的一环，结论确定。
-- **归类与路径无关（兼容范围）**：判定只依赖异常类型。`ErrorClassifier` 先剥掉
-  `CompletionException`/`ExecutionException` 等异步透明包装；外层只落到兜底类别
-  （INTERNAL_ERROR/UNKNOWN）时，继续沿 `cause` 链找更具体的根因（带成环保护）。
-  因此同一根因无论从同步入口进来、绕异步、或被任意 RuntimeException/受检异常
-  转译包装，最终类别一致，多条链路做类别统计不会被拆成两类。对外安全文案仍只来自
-  类别定义，不含异常类名、消息或堆栈。
+- **归类与路径无关，且以更深处更具体的根因为准**：判定只依赖异常类型。
+  `ErrorClassifier` 遍历异常的整条 cause 链（`CompletionException`/`ExecutionException`
+  等异步透明包装本身只落到兜底类别，无需特判剥层），在链上按以下规则选出唯一类别：
+  1. **具体度高者胜**：兜底（UNKNOWN/INTERNAL_ERROR）最低，超时（TIMEOUT）是比上游
+     IO 失败（UPSTREAM_FAILURE）更具体的归因，其余明确业务类别居中。因此**即使中间
+     那层异常本身也对得上某个具体类别，只要更深处还有更明确的根因，最终仍以更具体的
+     根因为准**。例如 `IllegalStateException`(→CONFLICT) 包着 `SocketTimeoutException`
+     (→TIMEOUT)，最终归 `TIMEOUT`，而不是 CONFLICT；
+  2. **具体度相同时取链上更深者**：同一条根因无论从同步入口直接抛、绕异步
+     （CompletableFuture/线程池），还是中途被任意 `RuntimeException`/受检异常包装或
+     转译（哪怕外层本身命中另一个具体类别），最终类别都一致，按失败类别做统计不会
+     因路径不同被拆成两类；
+  3. **兜底与成环安全**：整条链上确实没有更具体的根因时，维持外层已有的具体类别；
+     链上只有兜底类别时给 INTERNAL_ERROR/UNKNOWN；cause 自引用或互相引用成环时
+     用身份集合安全终止，绝不卡死或报错。
+
+  对外安全文案仍只来自类别定义，不含异常类名、消息或堆栈。
 
 ## 追踪上下文传播规则
 
@@ -168,10 +185,16 @@ mvn test
   结束时间倒序与 traceId 稳定次序、limit 默认值/封顶、游标分页不重不漏且可拼接成全量、
   坏游标从头开始、后台持续写入时同一条件结果不抖动且条目完整。
 - `TraceAttributionTest`：成功链路最慢子环、失败链路整链类别与最慢环、
-  同根因走同步/异步/CompletableFuture 包装三类路径归类一致、只有根 span 时回退、并列取更早。
+  同根因走同步/异步/CompletableFuture 包装三类路径归类一致、只有根 span 时回退、并列取更早，
+  以及**外层本身命中具体类别（CONFLICT）但深处是更具体的 TIMEOUT 根因时，
+  同步与异步路径都归 TIMEOUT**。
 - `ErrorClassifierTest`：类别可区分、异步包装与**任意 cause 链包装**结论一致、
-  cause 成环安全终止、安全文案不泄露内部信息。
-- `TraceQueryIntegrationTest`：端到端验证列表多条件筛选与归因字段、410/404 区分、游标翻页。
+  **外层具体类别被深处更具体根因压过**（CONFLICT/VALIDATION 包超时或连接失败等）、
+  同根因多路径（直接抛/异步/转译/多层包装）只归一类、链上无更具体根因时维持外层、
+  兜底类别成环与**具体类别互相引用成环**都安全终止、安全文案不泄露内部信息。
+- `TraceQueryIntegrationTest`：端到端验证列表多条件筛选与归因字段、410/404 区分、游标翻页，
+  以及**查询请求自身不落追踪（无 `X-Trace-Id`、连续重复查询响应体与结果集合不漂移、
+  同类别记录被同一条件一次查全）**。
 - `TracerConcurrencyTest`（回归）：32 线程并发建链不串链、异步子操作归属、失败不静默丢失。
 - `TraceIntegrationTest` / `BoundedTraceStoreTest`（回归）：端到端追踪与原有容量 FIFO、并发写入。
 

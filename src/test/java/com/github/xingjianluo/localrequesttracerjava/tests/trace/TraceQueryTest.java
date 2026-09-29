@@ -150,7 +150,10 @@ class TraceQueryTest {
 
     @Test
     void repeatedQueriesStayStableWhileWritesContinueAndItemsAreWhole() throws InterruptedException {
-        BoundedTraceStore store = new BoundedTraceStore(512);
+        // 容量需容纳"基准数据 + 整个并发写入期间的全部新数据"：
+        // 否则持续写入触发 FIFO 顶掉窗口内基准数据，属于容量语义的正常行为，
+        // 会让"窗口内集合稳定"这个前提不成立。
+        BoundedTraceStore store = new BoundedTraceStore(200_512);
         ExecutorService pool = Executors.newFixedThreadPool(2);
         CountDownLatch baseReady = new CountDownLatch(1);
         CountDownLatch stop = new CountDownLatch(1);
@@ -161,12 +164,11 @@ class TraceQueryTest {
                 baseReady.await();
                 long end = 10_000;
                 int i = 0;
-                while (stop.getCount() > 0) {
+                // 上限 100_000，配合 200_512 的容量，任何时刻都不会发生容量回收；
+                // stop 信号到达后通常还会先写完一批，但总量仍远低于容量。
+                while (stop.getCount() > 0 && i < 100_000) {
                     // 全部落在固定时间窗之后，保证查询窗口内集合稳定
                     store.save(success("w-%05d".formatted(i++), end++));
-                    if (i > 200_000) {
-                        break;
-                    }
                 }
             } catch (Throwable t) {
                 writerError.set(t);
